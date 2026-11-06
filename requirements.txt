@@ -1,0 +1,32 @@
+# Base dependencies (Day 1). Exact versions are frozen in requirements-lock.txt.
+# Install: .venv\Scripts\python -m pip install -r requirements-lock.txt
+
+# Data
+pandas
+numpy
+
+# Scraping
+httpx[http2]
+selenium
+beautifulsoup4
+lxml
+pydantic
+
+# Database / geospatial
+sqlalchemy
+psycopg[binary]
+geopandas
+shapely
+h3
+geopy
+
+# ML / visualisation
+scikit-learn
+matplotlib
+seaborn
+folium
+
+# Utilities / dev
+python-dotenv
+pytest
+jupyter

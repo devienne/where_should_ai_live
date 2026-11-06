@@ -1,0 +1,30 @@
+# --- Data: never committed (scraped data stays private) ---
+data/**
+!data/**/
+!data/**/.gitkeep
+tests/fixtures/
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# --- Private notes (plan, to-do list) ---
+notes/
+
+# --- Secrets ---
+.env
+
+# --- Large / generated files ---
+*.parquet
+*.pbf
+osrm/
+mlruns/
+
+# --- Editor / OS ---
+.vscode/
+.DS_Store
+Thumbs.db
