@@ -35,8 +35,10 @@ def test_clean_listing_url_drops_query_and_fragment():
     ("2 vagas", "vagas", 2),
     ("Sem vaga", "vagas", 0),
     ("Aceita pet", "pet", "sim"),
+    ("Não aceita pet", "pet", "não"),
     ("Sem mobília", "mobiliado", "não"),
-    ("Metrô próximo", "metro_proximo", "sim"),
+    ("Metrô próx.", "metro_proximo", "sim"),
+    ("Sem metrô próx.", "metro_proximo", "não"),
 ])
 def test_update_from_text(text, field, expected):
     p = PropertyInfo(url="u")

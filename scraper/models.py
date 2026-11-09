@@ -143,16 +143,18 @@ class PropertyInfo:
         elif "andar" in text_lower and self.andar is None:
             self.andar = text
         
-        # Pet policy
+        # Pet policy (check the negative wording first: "Não aceita pet" contains "aceita pet")
         elif "aceita pet" in text_lower:
-            self.pet = "sim"
-        
+            negative = any(neg in text_lower for neg in ("não aceita", "nao aceita"))
+            self.pet = "não" if negative else "sim"
+
         # Furniture
         elif "sem mobília" in text_lower or "sem mobiliá" in text_lower:
             self.mobiliado = "não"
-        
-        # Metro proximity
-        elif "metrô" in text_lower:
-            self.metro_proximo = "sim"
+
+        # Metro proximity ("Sem metrô próx." / "Não ... metrô" must not count as near)
+        elif "metrô" in text_lower or "metro próx" in text_lower:
+            negative = any(neg in text_lower for neg in ("sem metr", "não", "nao", "longe"))
+            self.metro_proximo = "não" if negative else "sim"
 
             

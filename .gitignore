@@ -15,8 +15,12 @@ __pycache__/
 # --- Private notes (plan, to-do list) ---
 notes/
 
+# --- Data produced by the article demo scripts ---
+articles/**/*.csv
+
 # --- Private notebooks (outputs contain real listing data) ---
 notebooks/00_quick_map.ipynb
+notebooks/01_data_quality.ipynb
 
 # --- Secrets ---
 .env
