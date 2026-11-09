@@ -15,6 +15,9 @@ __pycache__/
 # --- Private notes (plan, to-do list) ---
 notes/
 
+# --- Private notebooks (outputs contain real listing data) ---
+notebooks/00_quick_map.ipynb
+
 # --- Secrets ---
 .env
 
