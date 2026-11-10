@@ -26,7 +26,8 @@ def get_engine() -> Engine:
         port=int(os.getenv("POSTGRES_PORT", "5432")),
         database=os.environ["POSTGRES_DB"],
     )
-    return create_engine(url)
+    # Fail after 5 s instead of hanging when the database is unreachable (e.g. Docker not running)
+    return create_engine(url, connect_args={"connect_timeout": 5})
 
 
 def check_connection() -> None:
