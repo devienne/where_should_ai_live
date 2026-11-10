@@ -1,0 +1,25 @@
+# Local services for "Where should AI live?"
+# Start:  docker compose up -d      Stop:  docker compose down
+# Credentials come from the .env file next to this one (see .env.example).
+
+services:
+  db:
+    image: postgis/postgis:16-3.4          # PostgreSQL 16 with the PostGIS 3.4 extension pre-installed
+    container_name: wsal_db                # fixed name, easier to reference in commands
+    restart: unless-stopped                # comes back after a Docker / PC restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"      # host port (from .env, default 5432) -> container port 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data    # keeps the data when the container is removed
+    healthcheck:                           # lets Docker report when the database is ready to accept connections
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:                                  # named volume managed by Docker
