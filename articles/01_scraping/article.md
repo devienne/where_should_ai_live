@@ -1,248 +1,339 @@
-# Where should AI live? — Part 1: Collecting 2,500 rental listings in São Paulo (without being a bad citizen)
+# Where should AI live? — Part 1: Scraping a JavaScript website with Selenium and requests
 
-*This is the first article in a series about building a home finder that starts from a simple question: **"How long are you willing to commute?"** Each article covers one stage: data collection, database, mobility data, machine learning, the app, and an LLM chatbot.*
-
----
-
-## Why start with the data?
-
-Most rental websites let you filter by price, number of bedrooms or neighbourhood. None of them answer the question people actually care about in a city like São Paulo: *"If I work at Avenida Paulista and I'm willing to spend 40 minutes on the metro, where can I live?"*
-
-Answering that needs three ingredients:
-
-1. **Listings with exact locations.** This article covers them.
-2. **Travel times between any two points in the city.** That is a later article on mobility data.
-3. **A way to rank what's left.** Later articles cover clustering and recommendation.
-
-Everything downstream depends on the first ingredient, so it deserves care. This article covers how I collected **2,489 listings across 25 neighbourhoods**, what went wrong along the way, and how the dataset was cleaned and tested.
-
-> **Note on the data:** this is an educational, non-commercial project. The scraped data is kept private and isn't published; only code and aggregated results are shared. More on that in the [ethics section](#ethics-what-i-did-and-didnt-do).
+*This is the first article in a series about building a São Paulo home finder. Each article covers one stage: data collection, database, mobility data, machine learning, the app, and an LLM chatbot.*
 
 ---
 
-## Scope: 25 neighbourhoods, 5 per zone
+## The question: where can I live, given how long I'm willing to commute?
 
-São Paulo is huge: 96 districts and more than 11 million people. To keep the project manageable, I picked **5 neighbourhoods in each of the city's 5 zones** (Centro, Oeste, Sul, Norte, Leste) and capped collection at **100 listings per neighbourhood**. That is enough for analysis, small enough to collect in under an hour, and it covers the city's very different housing markets, from Pinheiros to Itaquera.
+Anyone who has rented a flat in a big city knows the trade-off: cheaper homes tend to be farther away, and the commute eats the savings, in time if not in money. So the question people actually ask is not *"what's available in Pinheiros?"* but:
 
-| Zone | Neighbourhoods |
-|---|---|
-| Centro | República, Bela Vista, Consolação, Liberdade, Santa Cecília |
-| Oeste | Butantã, Perdizes, Pinheiros, Vila Leopoldina, Vila Madalena |
-| Sul | Brooklin, Interlagos, Moema, Santo Amaro, Vila Mariana |
-| Norte | Casa Verde, Mandaqui, Santana, Tucuruvi, Vila Maria |
-| Leste | Itaquera, Mooca, Penha, São Miguel Paulista, Tatuapé |
+> **"I work here, and I'm willing to spend up to 40 minutes getting there. Where can I live?"**
+
+Answering it needs two things: travel times across the city, which later articles cover, and **a list of homes for rent, with their prices and locations**.
+
+Rental platforms such as **QuintoAndar**, one of Brazil's largest, have exactly that list. But they're built for browsing one neighbourhood at a time, and none of them can filter by commute time. Opening hundreds of listings by hand and copying their details would take days.
+
+So in this article I build a **web scraper**: a program that visits the listing pages and collects their details into a table. It is deliberately small and polite, and the [Ethics](#ethics) section at the end explains the rules it follows. The full code is a single file, [`scrape_listings.py`](scrape_listings.py), and this article walks through it function by function.
 
 ---
 
-## Architecture: two stages, two tools
+## First, understand the website
 
-The scraper has two stages, because the two pages involved behave differently.
+Before writing any scraping code, it pays to understand how the pages are built, because that decides which tools you need. The scraper deals with two kinds of page:
 
-```
- Search page (per neighbourhood)            Listing pages (one per property)
- ┌───────────────────────────────┐          ┌──────────────────────────────────┐
- │ JavaScript-rendered,          │  URLs    │ Server-rendered HTML with         │
- │ "Load more" button            │ ───────► │ structured data (JSON-LD, Next.js)│
- │ → Selenium (headless Chrome)  │          │ → httpx (async, HTTP/2)           │
- └───────────────────────────────┘          └──────────────────────────────────┘
-                                                          │
-                                                          ▼
-                                     parser → one CSV per neighbourhood → merge → clean
-```
+- **The search page** of a neighbourhood shows listing cards, with a **"Load more"** button at the bottom.
+- **A listing page** shows one property: price table, area, bedrooms, parking and a map.
 
-**Stage 1: collect URLs with Selenium.** The neighbourhood search page loads 12 listings at a time, and more appear only when you click "Load more". This needs a real browser, so Selenium drives headless Chrome, clicks until it has 100 listing links, and saves them to a text file. If the run is interrupted, the file is reused.
+Web pages come in two broad kinds:
 
-**Stage 2: fetch listings with async HTTP.** Individual listing pages don't need a browser; the HTML already contains everything. Opening 2,500 pages in Chrome would be slow and wasteful, so this stage uses `httpx` with `asyncio`:
+| | **Static HTML** | **JavaScript-rendered (dynamic)** |
+|---|---|---|
+| What the server sends | the finished page, data included | code that fetches the data and builds the page inside your browser |
+| What a plain HTTP request gets | everything you see | only what was there *before* the JavaScript ran |
+| Tool | `requests` + BeautifulSoup: fast and light | a real browser driven by code, such as **Selenium**: slow and heavy |
+
+Many modern sites are a **hybrid**: the server sends a first version of the page, and JavaScript takes over for anything interactive, such as filters, infinite scroll or *"Load more"*. Three quick checks tell you which parts are which:
+
+1. **"View page source" versus "Inspect".** *View page source* shows the HTML the server sent. *Inspect* (DevTools) shows the page as it is now, after JavaScript has changed it. Data that appears only in *Inspect* was added by JavaScript.
+2. **Turn JavaScript off.** In Chrome DevTools, press `Ctrl+Shift+P`, type *"Disable JavaScript"* and reload. Whatever still works came from the server.
+3. **Ask Python.** Download the page without a browser and count what you get:
 
 ```python
-semaphore = asyncio.Semaphore(CONCURRENCY)   # at most 3 requests in flight
-
-async def process_with_semaphore(url):
-    async with semaphore:
-        result = await self.process_single_url(client, url)
-        await asyncio.sleep(REQUEST_DELAY)    # 1 s pause after every request
-        return result
+html = requests.get(search_url, headers=HEADERS, timeout=20).text
+soup = BeautifulSoup(html, "lxml")
+cards = soup.select("div[data-testid='house-card-container-rent'] a")
+print(len({a["href"] for a in cards}))          # listing links in the raw HTML
 ```
 
-Retries use **exponential backoff**. A `429 Too Many Requests` doubles the wait each attempt (2 s, 4 s, 8 s), a `5xx` server error retries with a growing delay, and other `4xx` errors aren't retried at all. In the final run, 12 of 2,489 pages couldn't be fetched. About half were still answering `503` after three attempts, and the rest returned `404` because the listing had been taken down between collecting the URL and fetching the page. Listings rent fast!
+For QuintoAndar, this showed:
 
-**Throughput:** about 2 minutes per neighbourhood, and **46 minutes** for all 25.
+- **The search page is a hybrid.** The raw HTML already contains the **first 24 listings**, together with the "Load more" button. Every batch after that is fetched by JavaScript when the button is clicked, and `requests` can download the button but not click it.
+- **Listing pages are static.** The raw HTML contains every fact, every price, and the page's embedded data.
+
+That gives the design: **use a browser only where JavaScript is unavoidable.**
+
+```
+ Search page (per neighbourhood)             Listing pages (one per property)
+ ┌────────────────────────────────┐          ┌──────────────────────────────────┐
+ │ first 24 cards in the HTML,    │  URLs    │ everything in the HTML           │
+ │ more only via "Load more" (JS) │ ───────► │ (facts, prices, embedded JSON)   │
+ │ → Selenium (headless Chrome)   │          │ → requests + BeautifulSoup       │
+ └────────────────────────────────┘          └──────────────────────────────────┘
+                                                            │
+                                                            ▼
+                                                  one CSV row per listing
+```
 
 ---
 
-## Parsing: three places to look for the same fact
+## The script, function by function
 
-A listing page contains the same information in several forms. The parser tries the most reliable source first:
-
-1. **JSON-LD** (`<script type="application/ld+json">`): structured data meant for search engines. It is stable and machine-readable, and it carries the address and price.
-2. **The visible DOM**, through CSS selectors such as `data-testid="house-main-info"`. This is where area, bedrooms, bathrooms, parking, floor, pets and furniture appear as short texts like *"2 quartos (1 suíte)"* or *"Aceita pet"*.
-3. **Next.js page data** (`<script id="__NEXT_DATA__">`), a large JSON blob that the front-end framework uses to hydrate the page. This is where the **coordinates** were.
-
-### Finding coordinates without knowing where they are
-
-I didn't want to hard-code a path like `props.pageProps.house.address.lat`, which would break the next time the site's front-end changes. So the parser searches the JSON **recursively** for any object with latitude/longitude-like keys, and **validates** the values against a bounding box around São Paulo:
+### Settings and selectors
 
 ```python
-def _find_coords(obj, depth=0):
+BASE_URL = "https://www.quintoandar.com.br"
+REQUEST_DELAY = 1.0      # seconds to pause after each listing page
+TIMEOUT = 20             # seconds to wait for a server response
+
+CARD_LINKS = "div[data-testid='house-card-container-rent'] a"
+LOAD_MORE  = "button#see-more, button[data-testid='load-more-button']"
+MAIN_INFO  = "div[data-testid='house-main-info'] .MainInfo_iconDescriptionWrapper__St8RA"
+PRICE_ROWS = "ul[data-testid='listing-price-table'] li"
+```
+
+The **CSS selectors** say where things are on the page. I found them in DevTools by right-clicking an element, choosing *Inspect*, and looking for an attribute that identifies it.
+
+Not all selectors are equally robust. **`data-testid` attributes** are added by the site's developers for their own automated tests, so they tend to survive redesigns. **Generated class names** like `MainInfo_iconDescriptionWrapper__St8RA` end in a hash that can change with every release of the site. Keeping all selectors at the top of the file means there's one place to fix when that happens.
+
+### `clean_url(href)`: respecting robots.txt
+
+```python
+def clean_url(href: str) -> str:
+    p = urlsplit(href)
+    return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+```
+
+Links on the search page carry tracking parameters, such as `.../imovel/893860514/alugar?search_id=...&rank=3`. The site's `robots.txt`, where a site states what bots may and may not fetch, **disallows URLs with those parameters**. `clean_url` rebuilds the link without the query string (`?…`) and fragment (`#…`), which gives the plain listing URL that robots.txt allows. It also means two links to the same listing become one URL, so nothing is downloaded twice.
+
+### `collect_urls(bairro, n)`: driving a browser with Selenium
+
+This is the JavaScript part, and it works in four steps.
+
+**1. Start a headless Chrome.**
+
+```python
+options = Options()
+options.add_argument("--headless=new")
+driver = webdriver.Chrome(options=options)
+wait = WebDriverWait(driver, 12)
+```
+
+*Headless* means Chrome runs normally, just without a window. Since version 4.6, Selenium downloads the matching ChromeDriver by itself, so an installed Chrome is the only requirement. `WebDriverWait` waits up to 12 seconds for a condition to become true.
+
+**2. Wait for the page to be ready, instead of sleeping.**
+
+```python
+driver.get(search_url)
+wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, CARD_LINKS)))
+```
+
+`driver.get` returns as soon as the page *starts* loading, while JavaScript may still be working. The classic mistake is to add `time.sleep(5)`: too long on a fast connection, too short on a slow one. An **explicit wait** returns the moment the first listing card exists.
+
+**3. Collect the links, then click "Load more" and wait for new cards.**
+
+```python
+for card in driver.find_elements(By.CSS_SELECTOR, CARD_LINKS):
+    href = card.get_attribute("href")
+    if href and clean_url(href) not in urls:
+        urls.append(clean_url(href))
+
+n_cards = len(driver.find_elements(By.CSS_SELECTOR, CARD_LINKS))
+button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, LOAD_MORE)))
+driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+driver.execute_script("arguments[0].click();", button)
+wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, CARD_LINKS)) > n_cards)
+```
+
+Each round reads *all* cards on the page, and the `not in urls` check skips the ones already collected. A list rather than a set keeps the site's order. Then:
+
+- **The click goes through JavaScript.** A normal `button.click()` imitates a mouse and fails if anything covers the button, such as a cookie banner or a floating header. Calling the button's own `click()` avoids that.
+- **The script waits for the effect, not for time.** It counts the cards before clicking and waits until there are more. There's no ready-made condition for "new content arrived", but `wait.until` accepts any function, and this `lambda` is exactly that check.
+- **The end of the list** shows up the same way. When the button is gone, or no new cards appear within 12 seconds, the wait raises `TimeoutException`, and the loop stops.
+
+**4. Always close the browser.**
+
+```python
+try:
+    ...
+finally:
+    driver.quit()
+```
+
+Each Chrome uses hundreds of MB of memory. `try/finally` closes it even if something fails halfway through, instead of leaving an invisible browser running after every crash.
+
+### `fetch_page(session, url)`: plain HTTP for the static pages
+
+```python
+def fetch_page(session, url):
+    try:
+        response = session.get(url, timeout=TIMEOUT)
+    except requests.RequestException as error:
+        print(f"      failed: {url} ({error.__class__.__name__})")
+        return None
+    if response.status_code != 200:
+        print(f"      HTTP {response.status_code}: {url}")
+        return None
+    return response.text
+```
+
+Listing pages don't need a browser, so this stage is ordinary HTTP:
+- **The session.** A `requests.Session` reuses one connection and sends the same headers each time: a normal browser `User-Agent` and `Accept-Language: pt-BR`, so the server returns the page a visitor would see.
+- **The timeout** stops a silent server from making the script wait forever.
+- **Error codes.** A `404` usually means the listing was rented and removed after its URL was collected. A `429 Too Many Requests` means slow down. Either way, the function reports it and returns `None`, and the scraper moves on.
+
+### `parse_listing(html, url)`: from HTML to a row of data
+
+BeautifulSoup turns about 300 KB of HTML into a dozen fields. Each field is read from wherever it's easiest to get.
+
+**The facts block** is a row of short texts such as *"45 m²"*, *"2 quartos (1 suíte)"*, *"1 vaga"* and *"Aceita pet"*:
+
+```python
+facts = [" ".join(b.stripped_strings).lower() for b in soup.select(MAIN_INFO)]
+text = " | ".join(facts)
+row["area_m2"]  = first_int(r"(\d+)\s*m²", text)
+row["bedrooms"] = first_int(r"(\d+)\s*quarto", text)
+row["parking"]  = first_int(r"(\d+)\s*vaga", text) or 0          # "-" means no parking
+row["pet_friendly"] = "aceita pet" in text and "não aceita pet" not in text
+```
+
+`soup.select` returns every element that matches a selector, and `stripped_strings` gives each element's text without extra whitespace. All the facts are joined into one lower-case string. A small helper then pulls out the numbers:
+
+```python
+def first_int(pattern, text):
+    m = re.search(pattern, text)
+    return int(m.group(1)) if m else None
+```
+
+`r"(\d+)\s*quarto"` means *one or more digits, optional spaces, then "quarto"*. The parentheses capture the digits, and the same pattern matches "1 quarto" and "3 quartos". If there's no match, the result is `None` rather than an error.
+
+**The price table** has rows like *"Aluguel — R$ 2.000"* or *"Condomínio — Incluso"*:
+
+```python
+for li in soup.select(PRICE_ROWS):
+    parts = list(li.stripped_strings)               # ["Aluguel", "R$ 2.000"]
+    label, value = parts[0], parts[-1]
+    number = re.sub(r"[^\d]", "", value)            # "R$ 2.000" -> "2000"
+    row[label] = 0 if value.lower().startswith("inclu") else (int(number) if number else None)
+```
+
+In Brazil the dot is the thousands separator (*R$ 2.000* is two thousand reais), so the safest approach is to keep only the digits. *"Incluso"*, meaning already included in the rent, becomes 0. Using each row's own label as the column name means a new fee added by the site later becomes a new column automatically.
+
+**Data that isn't printed on the page.** The location appears only as a Google Map, not as text. The HTML does, however, carry two blocks of **structured data**: JSON inside `<script>` tags.
+
+- **JSON-LD** (`<script type="application/ld+json">`) describes the page for search engines using the schema.org vocabulary: property type, address, price, and `geo` coordinates.
+- **`__NEXT_DATA__`** is the data the Next.js framework used to render the page, about 35 KB of JSON per listing.
+
+```python
+scripts = soup.find_all("script", {"type": "application/ld+json"}) + \
+          soup.find_all("script", {"id": "__NEXT_DATA__"})
+for script in scripts:
+    coords = find_coords(json.loads(script.get_text()))
+    if coords:
+        row["lat"], row["lon"] = coords
+        break
+```
+
+Embedded JSON is often the most reliable part of a page to scrape. It's structured and typed, and it doesn't change when the visual design does.
+
+### `find_coords(obj)`: searching JSON you don't control
+
+```python
+def find_coords(obj):
     if isinstance(obj, dict):
-        lat = _to_float(obj.get("latitude", obj.get("lat")))
-        lon = _to_float(obj.get("longitude", obj.get("lng", obj.get("lon"))))
-        if _valid_sp_coords(lat, lon):          # -24.1 < lat < -23.3, -47.0 < lon < -46.3
-            return lat, lon
-        for value in obj.values():
-            if found := _find_coords(value, depth + 1):
-                return found
+        try:
+            lat = float(obj.get("latitude", obj.get("lat")))
+            lon = float(obj.get("longitude", obj.get("lng", obj.get("lon"))))
+            if -24.1 < lat < -23.3 and -47.0 < lon < -46.3:
+                return lat, lon
+        except (TypeError, ValueError):
+            pass
+        children = obj.values()
     elif isinstance(obj, list):
-        ...
+        children = obj
+    else:
+        return None
+    for child in children:
+        found = find_coords(child)
+        if found:
+            return found
+    return None
 ```
 
-The bounding box matters. Without it, a `{"lat": 0, "lng": 0}` placeholder elsewhere in the page would be accepted as a valid location in the Atlantic Ocean.
+Hard-coding a path like `data["props"]["pageProps"]["house"]["address"]["lat"]` would break the next time the site's developers reorganise their data. Instead, `find_coords` is **recursive**: it checks the current object for latitude/longitude keys, and if they aren't there, it calls itself on everything inside.
 
-**Result: 97.5% of listings came with exact coordinates.** I had planned a whole day for geocoding street addresses with OpenStreetMap's Nominatim, and it turned out to be unnecessary. That was lucky, because **65% of listings hide their street address** and only show the placeholder *"Condomínios em São Paulo"*. Geocoding would have failed for most of them.
+`float(None)` and `float("abc")` raise errors, which here simply mean "not here, keep looking". The **bounding box** around São Paulo matters too. Without it, a placeholder such as `{"lat": 0, "lng": 0}` elsewhere in the page would put the apartment in the Atlantic Ocean.
 
----
-
-## The bug that a single number revealed
-
-After the first full run, a quick look at the value distributions showed this:
-
-```
-pet            {'sim': 0.731, 'não': 0.269}
-metro_proximo  {'sim': 0.992, 'não': 0.008}
-```
-
-**99.2% of listings "near a metro station"**, in a sample that includes Itaquera, Interlagos and São Miguel Paulista? That is not plausible.
-
-The cause was a classic substring bug:
+### `main()`: putting it together
 
 ```python
-elif "aceita pet" in text_lower:      # "Não aceita pet" contains "aceita pet"!
-    self.pet = "sim"
-elif "metrô" in text_lower:           # "Sem metrô próx." contains "metrô"!
-    self.metro_proximo = "sim"
+urls = collect_urls(args.bairro, args.n)                  # stage 1: Selenium
+
+with requests.Session() as session:
+    session.headers.update(HEADERS)
+    for url in urls:
+        html = fetch_page(session, url)                   # stage 2: requests
+        if html:
+            rows.append(parse_listing(html, url))         # stage 3: BeautifulSoup
+        time.sleep(REQUEST_DELAY)                         # be polite
+
+pd.DataFrame(rows).to_csv(out, index=False, encoding="utf-8-sig")
 ```
 
-Negative wording matched the positive keyword. The fix checks for negations first and is covered by tests that use the exact phrasings:
+`argparse` reads three command-line options: `--bairro`, the neighbourhood as written in the site's URLs; `--n`, the number of listings; and `--out`, the file name. The one-second pause between pages keeps the load on the site low. Saving with `utf-8-sig` makes Excel display *"Condomínio"* and *"São Paulo"* correctly.
+
+---
+
+## Going further: async downloads and backoff
+
+Downloading one page at a time is right for a few dozen listings. For the full project, about 2,500 listings across 25 neighbourhoods, the project's scraper keeps **three requests in flight at once** with `httpx` and `asyncio`:
 
 ```python
-@pytest.mark.parametrize("text, field, expected", [
-    ("Aceita pet",       "pet",           "sim"),
-    ("Não aceita pet",   "pet",           "não"),
-    ("Metrô próx.",      "metro_proximo", "sim"),
-    ("Sem metrô próx.",  "metro_proximo", "não"),
-])
+semaphore = asyncio.Semaphore(3)                 # at most 3 requests at the same time
+
+async def worker(url):
+    async with semaphore:                        # wait for a free slot
+        html = await fetch(client, url)
+        await asyncio.sleep(REQUEST_DELAY)       # still pause after every request
+    return parse_listing(html, url) if html else None
+
+rows = await asyncio.gather(*(worker(u) for u in urls))
 ```
 
-After the fix and a re-scrape, the metro share dropped from **99.2% to 64.9%**, a believable number. The pet share barely moved (73.1% → 71.8%), so *"Não aceita pet"* turned out to be rare, but the code is now right for both.
-
-**Lesson:** the parser reported a 100% success rate the whole time, because "success" only meant *no exception was raised*. Wrong values don't raise exceptions, and a `value_counts()` on every categorical column is the cheapest data test there is.
+It also **retries with exponential backoff**. After a `429` or a server error (`5xx`), it waits 2 s, then 4 s, then 8 s before trying again, giving the server room to recover. A `404` is never retried, because the listing is gone. With this setup, the full collection took **46 minutes**: concurrency makes a scraper faster, and the semaphore and the pauses keep it polite.
 
 ---
 
-## Cleaning: the funnel
+## Ethics
 
-Raw scraped data is never analysis-ready. The cleaning step (`scraper/clean.py`) is a sequence of filters, and it logs how many rows each one removes:
+This scraper follows the site's `robots.txt`: it fetches only the search and listing pages that robots.txt allows, and removes the tracking parameters that it disallows. It keeps the load low, with a pause after every request, at most three requests at a time in the full run, and a one-off collection of 100 listings per neighbourhood. It collects no personal data: no names, phone numbers, photos or descriptions, only facts about the property. It doesn't hide that it's automated.
 
-| Step | Rows left | Removed |
-|---|---:|---:|
-| Raw listings | 2,489 | — |
-| Parsed successfully | 2,477 | 12 |
-| In the city of São Paulo | 2,473 | 4 |
-| Has coordinates | 2,424 | 49 |
-| Area between 10 and 1,000 m² | 2,419 | 5 |
-| Cost per m² between R$ 5 and R$ 400 | 2,418 | 1 |
-| Within 4 km of its neighbourhood's centre | 2,416 | 2 |
+The coordinates aren't printed as text on the listing pages. The site shows them on its map and publishes them in the page's structured data for search engines. Many listings hide their street address, so I never publish individual listings or locations. The data stays on my machine, and later articles only show results aggregated over areas of about 0.7 km².
 
-Some cases worth highlighting:
-
-- **The title as a backup source.** The parking field was empty for about half the listings, because the page shows `-` when there's no parking spot. The title is generated by the site in a fixed format, *"Studio para alugar com 31m², 1 quarto e sem vaga"*, so a regex on the title fills parking, bedrooms and area when the main block is empty.
-- **A neighbouring city in the results.** The *Vila Maria* search returned a few listings from **Vila Maria in Guarulhos**, a different city. The listing URL ends with the city name (`…-vila-maria-guarulhos`), which makes them easy to filter out.
-- **A URL format I didn't know about.** My first city filter (`url.endswith("-sao-paulo")`) wrongly removed 14 listings from São Miguel Paulista. They turned out to be partner-agency ads ("classificados") with a short URL, `/classificado/<id>/alugar`, which has no city in it at all. They are legitimate listings, just without QuintoAndar's service fee and insurance. I fixed the filter to drop only URLs that *name another city*.
-- **Points far from home.** A listing more than 4 km from the median location of its neighbourhood's listings is probably mislabelled, and is dropped.
-- **Plausibility ranges.** Area must be between 10 and 1,000 m², total monthly cost between R$ 300 and R$ 50,000, and cost per m² between R$ 5 and R$ 400.
-
-**Final dataset: 2,416 listings (97.1% of raw), 26 columns, all with coordinates**, and an almost even split across zones (474–488 each).
-
-![Missing values per column in the raw data](figures/missing_values.png)
-*Missing values in the raw data. Parking looks half-empty, but it's really "no parking", which the title confirms.*
-
----
-
-## A first look at the data
-
-![Distributions of total cost, area and cost per m²](figures/distributions.png)
-*Typical listing: R$ ~3,500 per month in total, 45 m², ~R$ 76 per m². All three have long right tails (big houses and luxury flats).*
-
-![Cost per m² by zone](figures/cost_per_m2_by_zone.png)
-
-| Zone | Median total cost per m² (R$/month) |
-|---|---:|
-| Oeste | 109 |
-| Centro | 94 |
-| Sul | 94 |
-| Norte | 55 |
-| Leste | 53 |
-
-The west and centre of the city cost about twice as much per square metre as the north and east. Commute time is a big part of that, which is exactly what the next articles will quantify.
-
----
-
-## Testing a scraper
-
-Scrapers are notoriously hard to test, because the thing they depend on (someone else's website) changes without notice. I used two kinds of test:
-
-- **Synthetic unit tests**, which always run. They cover hand-written snippets such as `"2 quartos (1 suíte)"`, `"Sem vaga"`, a minimal HTML page with JSON-LD, URL cleaning, coordinate validation, price parsing (`"R$ 1.400"` → 1400, `"Incluso"` → 0) and an end-to-end run of the cleaning function on five fake rows.
-- **Fixture tests**, which use three real listing pages saved to disk: one with a visible street, one with a hidden address, and one without parking. They check that price, area, rooms, address and coordinates are all extracted. Because they contain real data, the fixtures are git-ignored, and the tests **skip themselves** when the files are missing, so the public repo's test suite still passes.
-
-Current status: **32 tests passing.**
-
----
-
-## Ethics: what I did and didn't do
-
-Scraping sits in a grey zone, and it's worth being explicit about the choices made here.
-
-**What I did:**
-- **Respected `robots.txt`.** The site allows the neighbourhood search pages and the listing pages, and disallows URLs with tracking parameters such as `?search_id=`. The search page's links include exactly those parameters, so the collector **strips query strings** before fetching any listing.
-- **Kept the load low.** Three concurrent requests, a 1-second pause after each, backoff on errors, 100 listings per neighbourhood, and a one-off collection with no continuous crawling.
-- **Collected no personal data.** No names, phone numbers, photos or free-text descriptions, only listing facts: price, area, rooms and location. That keeps the project clear of LGPD (Brazil's data-protection law) concerns.
-- **Didn't disguise the bot.** The original version of this scraper had code to hide that the browser was automated (masking `navigator.webdriver`). I removed it, because it doesn't belong in a project that claims to be polite.
-
-**What I didn't do:**
-- **Publish the data.** The repository contains only code. The data, the saved pages and the exploratory notebooks with real values stay on my machine, and articles show aggregated results only.
-- **Use it commercially.** This is a learning project.
-
-I also want to be transparent that, like many websites, QuintoAndar's Terms of Use do not permit automated data collection. For a portfolio project, I chose to collect a small, one-off sample under the constraints above and to keep it private. If you build on this code, read the terms of the site you target, and prefer an official API or an openly licensed dataset when one exists.
+Finally, like many websites, QuintoAndar's Terms of Use don't permit automated data collection. This is a non-commercial learning project, and I chose to collect a small, private sample under the rules above. If you adapt this code, read the terms of the site you target, and prefer an official API or an open dataset when one exists.
 
 ---
 
 ## Try it yourself
 
-Alongside this article there's a **single-file version** of the scraper, [`scrape_listings.py`](scrape_listings.py), about 200 lines and with no project structure. It runs the whole machinery for one neighbourhood: Selenium for URLs, async httpx for the pages, the parser with coordinates, and a CSV at the end.
-
 ```bash
-pip install selenium "httpx[http2]" beautifulsoup4 lxml pandas
-python scrape_listings.py --bairro liberdade --n 15
+pip install selenium requests beautifulsoup4 lxml pandas
+python scrape_listings.py --bairro liberdade --n 30
 ```
 
 ```
-[1/3] Collecting 15 listing URLs from https://www.quintoandar.com.br/alugar/imovel/liberdade-sao-paulo-sp-brasil
+[1/3] Collecting 30 listing URLs from https://www.quintoandar.com.br/alugar/imovel/liberdade-sao-paulo-sp-brasil
       24 URLs so far
-[2/3] Fetching 15 listings (3 at a time, 1.0s pause)
-[3/3] Saved 15 listings to listings_liberdade.csv in 29s
+      36 URLs so far
+[2/3] Downloading 30 listing pages (1.0s pause between them)
+[3/3] Saved 30 listings to listings_liberdade.csv in 81s
       with coordinates: 100%
-   bedrooms  area_m2  parking  Aluguel  Total        lat        lon
-0         3      120        1     4500   6274 -23.569532 -46.639065
-1         1       29        0     2300   2873 -23.554612 -46.634240
-...
+   bedrooms  area_m2  parking  Aluguel  Total
+0         3      170        1     7000   8952
+1         3      171        1     3520   6444
+2         3      130        1     4780   5865
+3         3      163        1     9800  10237
+4         3      120        1     4500   6274
 ```
 
-Change `--bairro` to any neighbourhood slug from the site's URLs, such as `pinheiros` or `vila-mariana`, and `--n` to the number of listings you want. Keep it small, and keep the delays.
+The first 24 URLs come with the page. The jump to 36 is one click on "Load more", and the list is then cut to the 30 requested. Downloading the 30 pages takes most of the 81 seconds, mainly because of the one-second pauses. The coordinates are saved in the CSV but deliberately left out of the preview.
+
+Change `--bairro` to any neighbourhood slug from the site's URLs, such as `pinheiros` or `vila-mariana`. Asking for more than 24 listings makes the "Load more" loop run. Keep the numbers small, and keep the delays.
 
 ---
 
 ## What's next
 
-The dataset is clean, but it's still a pile of CSV files. In the next article I'll load it into **PostgreSQL with PostGIS**, index each listing on an **H3 hexagonal grid**, and write the spatial queries that the rest of the project depends on, such as *"listings within 500 m of a metro station"*.
+The scraper produces a table of homes with prices and locations. Next, I'll load it into **PostgreSQL with PostGIS**, index each listing on an **H3 hexagonal grid**, and write the spatial queries the rest of the project depends on, such as *"listings within 500 m of a metro station"*.
 
 *Code: [github.com/devienne/where_should_ai_live](https://github.com/devienne/where_should_ai_live)*

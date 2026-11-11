@@ -2,20 +2,21 @@
 Where should AI live? — Part 1 companion script
 ================================================
 
-A minimal, single-file version of the scraper described in the article:
+A minimal, single-file web scraper for rental listings, in two stages:
 
-  1. Selenium opens the neighbourhood search page and clicks "Load more" until it has N listing URLs
-  2. httpx fetches the listing pages concurrently (async, HTTP/2), politely
-  3. Each page is parsed: price table, area/rooms/parking..., and lat/lon from the embedded JSON
-  4. Results are saved to a CSV
+  1. The search page is built by JavaScript, so Selenium drives a real (headless) Chrome:
+     it opens the neighbourhood page and clicks "Load more" until it has N listing URLs.
+  2. Each listing page already contains its data in the HTML, so plain `requests` downloads
+     it, one page at a time with a pause, and BeautifulSoup extracts the fields.
+  The result is saved to a CSV.
 
 Requirements (Python 3.10+, Google Chrome installed):
-    pip install selenium "httpx[http2]" beautifulsoup4 lxml pandas
+    pip install selenium requests beautifulsoup4 lxml pandas
 
 Usage:
     python scrape_listings.py                          # 20 listings from Liberdade
-    python scrape_listings.py --bairro pinheiros --n 50
-    python scrape_listings.py --bairro vila-mariana --n 30 --out vila_mariana.csv
+    python scrape_listings.py --bairro pinheiros --n 30
+    python scrape_listings.py --bairro vila-mariana --n 10 --out vila_mariana.csv
 
 The bairro is the slug used in the site's URL:
     https://www.quintoandar.com.br/alugar/imovel/<bairro>-sao-paulo-sp-brasil
@@ -24,14 +25,13 @@ Please be considerate: keep N small, keep the delays, and read the target site's
 robots.txt and terms of use before running any scraper. Educational use only.
 """
 import argparse                                   # read command-line options (--bairro, --n, --out)
-import asyncio                                    # run many downloads concurrently
 import json                                       # parse the JSON embedded in the pages
 import re                                         # regular expressions to pull numbers out of text
-import time                                       # sleep between clicks and measure run time
+import time                                       # pauses and run time
 from urllib.parse import urlsplit, urlunsplit     # split a URL into parts and rebuild it
 
-import httpx                                      # async HTTP client (supports HTTP/2)
 import pandas as pd                               # tables and CSV output
+import requests                                   # simple HTTP client for static pages
 from bs4 import BeautifulSoup                     # HTML parser
 from selenium import webdriver                    # controls a real Chrome browser
 from selenium.common.exceptions import TimeoutException          # raised when a wait runs out of time
@@ -44,10 +44,8 @@ from selenium.webdriver.support.ui import WebDriverWait          # waits for a c
 # Settings
 # ----------------------------------------------------------------------------
 BASE_URL = "https://www.quintoandar.com.br"       # site root
-CONCURRENCY = 3                                   # max requests in flight at the same time
-REQUEST_DELAY = 1.0                               # seconds each worker pauses after a request
-RETRIES = 3                                       # attempts per page before giving up
-TIMEOUT = 20                                      # seconds to wait for a response
+REQUEST_DELAY = 1.0                               # seconds to pause after each listing page
+TIMEOUT = 20                                      # seconds to wait for a server response
 
 HEADERS = {                                       # HTTP headers sent with every request
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "  # identify as a
@@ -55,6 +53,7 @@ HEADERS = {                                       # HTTP headers sent with every
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",  # ask for the Portuguese version of the pages
 }
 
+# CSS selectors: where things are on the pages (found with the browser's DevTools)
 CARD_LINKS = "div[data-testid='house-card-container-rent'] a"    # links of the listing cards
 LOAD_MORE = "button#see-more, button[data-testid='load-more-button']"  # the "Load more" button
 MAIN_INFO = "div[data-testid='house-main-info'] .MainInfo_iconDescriptionWrapper__St8RA"  # facts block
@@ -62,7 +61,7 @@ PRICE_ROWS = "ul[data-testid='listing-price-table'] li"         # rows of the pr
 
 
 # ----------------------------------------------------------------------------
-# Stage 1 — collect listing URLs with Selenium
+# Stage 1 — collect listing URLs from the JavaScript search page (Selenium)
 # ----------------------------------------------------------------------------
 def clean_url(href: str) -> str:                  # remove "?..." and "#..." from a URL
     """Drop the query string: robots.txt disallows tracking parameters like ?search_id=."""
@@ -87,9 +86,8 @@ def collect_urls(bairro: str, n: int) -> list:    # return up to n listing URLs 
         while len(urls) < n:                      # keep going until we have n URLs
             for card in driver.find_elements(By.CSS_SELECTOR, CARD_LINKS):  # every card link on the page
                 href = card.get_attribute("href")  # the link's target URL
-                # keep absolute links we haven't seen yet, without their query string
-                if href and href.startswith("https") and clean_url(href) not in urls:
-                    urls.append(clean_url(href))  # store the cleaned URL
+                if href and clean_url(href) not in urls:  # a link we haven't stored yet?
+                    urls.append(clean_url(href))  # store it, without its query string
             print(f"      {len(urls)} URLs so far")  # progress message
             if len(urls) >= n:                    # enough URLs?
                 break                             # stop clicking
@@ -113,12 +111,30 @@ def collect_urls(bairro: str, n: int) -> list:    # return up to n listing URLs 
 
 
 # ----------------------------------------------------------------------------
-# Stage 3 — parse one listing page
+# Stage 2 — download a listing page (plain HTTP, no browser needed)
 # ----------------------------------------------------------------------------
-def find_coords(obj, depth=0):                    # search any JSON structure for lat/lon
+def fetch_page(session: requests.Session, url: str):  # the page's HTML, or None
+    try:                                          # network problems raise exceptions
+        response = session.get(url, timeout=TIMEOUT)  # send the request and wait for the answer
+    except requests.RequestException as error:    # timeout, connection refused, ...
+        print(f"      failed: {url} ({error.__class__.__name__})")  # report and move on
+        return None                               # no page
+    if response.status_code != 200:              # 404 = listing removed, 429 = too many requests, ...
+        print(f"      HTTP {response.status_code}: {url}")  # report and move on
+        return None                               # no page
+    return response.text                          # the HTML
+
+
+# ----------------------------------------------------------------------------
+# Stage 3 — extract the fields from one listing page (BeautifulSoup)
+# ----------------------------------------------------------------------------
+def first_int(pattern: str, text: str):           # first number captured by a regex, or None
+    m = re.search(pattern, text)                  # look for the pattern in the text
+    return int(m.group(1)) if m else None         # convert the captured digits to int
+
+
+def find_coords(obj):                             # search any JSON structure for lat/lon
     """Search nested JSON for latitude/longitude keys; accept only values inside São Paulo."""
-    if depth > 25:                                # safety limit against very deep nesting
-        return None                               # give up on this branch
     if isinstance(obj, dict):                     # a JSON object
         try:                                      # keys may be missing or not numbers
             lat = float(obj.get("latitude", obj.get("lat")))  # latitude under either key name
@@ -133,15 +149,10 @@ def find_coords(obj, depth=0):                    # search any JSON structure fo
     else:                                         # a plain value (text, number...)
         return None                               # nothing to search inside
     for child in children:                        # look inside each child
-        found = find_coords(child, depth + 1)     # recursive call one level deeper
+        found = find_coords(child)                # recursive call one level deeper
         if found:                                 # coordinates found somewhere below?
             return found                          # pass them up
     return None                                   # nothing found in this branch
-
-
-def first_int(pattern: str, text: str):           # first number captured by a regex, or None
-    m = re.search(pattern, text)                  # look for the pattern in the text
-    return int(m.group(1)) if m else None         # convert the captured digits to int
 
 
 def parse_listing(html: str, url: str) -> dict:   # turn one listing page into a dict of fields
@@ -160,7 +171,7 @@ def parse_listing(html: str, url: str) -> dict:   # turn one listing page into a
     row["bathrooms"] = first_int(r"(\d+)\s*banheiro", text)  # number before "banheiro(s)"
     row["parking"] = first_int(r"(\d+)\s*vaga", text) or 0   # number before "vaga(s)"; "-" means none
     row["floor"] = next((f for f in facts if "andar" in f), None)  # the fact mentioning the floor
-    # Check negative wording first: "não aceita pet" also contains "aceita pet"!
+    # Check negative wording too: "não aceita pet" also contains "aceita pet"!
     row["pet_friendly"] = "aceita pet" in text and "não aceita pet" not in text   # pets allowed?
     row["furnished"] = "mobiliado" in text and "sem mobília" not in text          # furnished?
     row["metro_near"] = "metrô próx" in text and "sem metrô" not in text          # near the metro?
@@ -169,12 +180,12 @@ def parse_listing(html: str, url: str) -> dict:   # turn one listing page into a
     for li in soup.select(PRICE_ROWS):            # each row of the price table
         parts = list(li.stripped_strings)         # the row's text pieces, e.g. ["Aluguel", "R$ 2.000"]
         if len(parts) >= 2:                       # need at least a label and a value
-            label, value = parts[0], parts[-1].replace("\xa0", " ")  # first piece = label, last = value
+            label, value = parts[0], parts[-1]    # first piece = label, last = value
             number = re.sub(r"[^\d]", "", value)  # keep only the digits ("R$ 2.000" -> "2000")
             # "Incluso" (included) means 0; otherwise the number, or None if there are no digits
             row[label] = 0 if value.lower().startswith("inclu") else (int(number) if number else None)
 
-    # Coordinates: JSON-LD and the Next.js page data
+    # Coordinates: not printed on the page, but present in the JSON blocks embedded in the HTML
     row["lat"] = row["lon"] = None                # default: no coordinates
     scripts = soup.find_all("script", {"type": "application/ld+json"}) + \
         soup.find_all("script", {"id": "__NEXT_DATA__"})     # the two kinds of embedded JSON
@@ -187,41 +198,6 @@ def parse_listing(html: str, url: str) -> dict:   # turn one listing page into a
             row["lat"], row["lon"] = coords       # store them
             break                                 # no need to look further
     return row                                    # the finished record
-
-
-# ----------------------------------------------------------------------------
-# Stage 2 — fetch listing pages concurrently (async + polite)
-# ----------------------------------------------------------------------------
-async def fetch(client: httpx.AsyncClient, url: str):  # download one page, with retries
-    for attempt in range(1, RETRIES + 1):         # attempts 1, 2, 3
-        try:                                      # network errors raise exceptions
-            r = await client.get(url)             # send the request and wait for the answer
-            if r.status_code == 200:              # OK
-                return r.text                     # return the HTML
-            if r.status_code == 429 or r.status_code >= 500:  # "too many requests" or server error
-                await asyncio.sleep(2 ** attempt)  # back off: wait 2, 4, 8 s
-                continue                          # and try again
-            return None                           # other 4xx (e.g. 404 removed listing): give up
-        except httpx.HTTPError:                   # timeout or connection problem
-            await asyncio.sleep(2 ** attempt)     # back off before retrying
-    return None                                   # all attempts failed
-
-
-async def fetch_and_parse_all(urls: list) -> list:  # download and parse all URLs
-    print(f"[2/3] Fetching {len(urls)} listings ({CONCURRENCY} at a time, {REQUEST_DELAY}s pause)")  # progress
-    semaphore = asyncio.Semaphore(CONCURRENCY)    # lets at most CONCURRENCY workers in at once
-
-    # One shared HTTP client: HTTP/2, our headers, timeout, and follow redirects
-    async with httpx.AsyncClient(http2=True, headers=HEADERS, timeout=TIMEOUT,
-                                 follow_redirects=True) as client:
-        async def worker(url):                    # the job for one URL
-            async with semaphore:                 # wait for a free slot
-                html = await fetch(client, url)   # download the page
-                await asyncio.sleep(REQUEST_DELAY)  # polite pause before releasing the slot
-            # parse the page, or record the failure
-            return parse_listing(html, url) if html else {"url": url, "error": "fetch failed"}
-
-        return await asyncio.gather(*(worker(u) for u in urls))  # run all jobs; results in URL order
 
 
 # ----------------------------------------------------------------------------
@@ -240,17 +216,27 @@ def main():                                       # entry point
     if not urls:                                  # nothing found?
         print("No listings found. Check the bairro slug in your browser.")  # likely a wrong slug
         return                                    # stop here
-    rows = asyncio.run(fetch_and_parse_all(urls))  # stages 2 + 3: download and parse
+
+    print(f"[2/3] Downloading {len(urls)} listing pages ({REQUEST_DELAY}s pause between them)")  # progress
+    rows = []                                     # one dict per listing
+    with requests.Session() as session:           # one session = reused connection, same headers
+        session.headers.update(HEADERS)           # send our headers with every request
+        for url in urls:                          # one page at a time
+            html = fetch_page(session, url)       # stage 2: download
+            if html:                              # got the page?
+                rows.append(parse_listing(html, url))  # stage 3: extract the fields
+            time.sleep(REQUEST_DELAY)             # be polite: pause before the next request
 
     df = pd.DataFrame(rows)                       # one row per listing
     out = args.out or f"listings_{args.bairro}.csv"  # output file name
     df.to_csv(out, index=False, encoding="utf-8-sig")  # save (utf-8-sig opens correctly in Excel)
 
     print(f"[3/3] Saved {len(df)} listings to {out} in {time.time() - start:.0f}s")  # summary
-    print(f"      with coordinates: {df['lat'].notna().mean():.0%}")  # share of rows with lat/lon
-    # Columns to preview (only those that exist)
-    preview = [c for c in ["bedrooms", "area_m2", "parking", "Aluguel", "Total", "lat", "lon"] if c in df]
-    print(df[preview].head().to_string())         # show the first 5 rows
+    if len(df):                                   # anything saved?
+        print(f"      with coordinates: {df['lat'].notna().mean():.0%}")  # share of rows with lat/lon
+        # Columns to preview (only those that exist); coordinates stay in the CSV, not on screen
+        preview = [c for c in ["bedrooms", "area_m2", "parking", "Aluguel", "Total"] if c in df]
+        print(df[preview].head().to_string())     # show the first 5 rows
 
 
 if __name__ == "__main__":                        # only when run as a script (not imported)
