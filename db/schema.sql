@@ -92,6 +92,25 @@ CREATE TABLE IF NOT EXISTS travel_times (
 
 
 -- ---------------------------------------------------------------------
+-- stations: metro / monorail / train (CPTM) stations in São Paulo city,
+-- from OpenStreetMap (db/load_stations.py). One row per station *per system*:
+-- an interchange like Luz has a 'metro' row and a 'train' row.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS stations (
+    station_id  TEXT PRIMARY KEY,               -- OSM id, e.g. 'node/123456'
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN ('metro', 'monorail', 'train')),
+    operator    TEXT,                           -- Metrô, CPTM, ViaQuatro, ViaMobilidade, ...
+    lat         DOUBLE PRECISION NOT NULL,
+    lon         DOUBLE PRECISION NOT NULL,
+    geog        GEOGRAPHY(POINT, 4326)
+                GENERATED ALWAYS AS (ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography) STORED
+);
+
+CREATE INDEX IF NOT EXISTS stations_geog_gix ON stations USING GIST (geog);
+
+
+-- ---------------------------------------------------------------------
 -- geocode_cache: address text -> coordinates (Nominatim), so each
 -- work address is looked up only once (Phase 4 recommender / chatbot).
 -- ---------------------------------------------------------------------

@@ -45,7 +45,7 @@ def test_postgis_enabled(engine):
     assert scalar(engine, "SELECT postgis_lib_version()").startswith("3.")
 
 
-@pytest.mark.parametrize("table", ["listings", "areas", "travel_times", "geocode_cache"])
+@pytest.mark.parametrize("table", ["listings", "areas", "travel_times", "geocode_cache", "stations"])
 def test_table_exists(engine, table):
     assert scalar(engine, "SELECT to_regclass(:t) IS NOT NULL", t=f"public.{table}")
 
