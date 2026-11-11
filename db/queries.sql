@@ -75,18 +75,66 @@ GROUP BY zone
 ORDER BY zone;
 
 
+-- name: station_premium_within_bairro
+-- Same question, but comparing near vs far *inside each bairro*, so the
+-- bairro's other qualities (prestige, safety, size of homes) are held constant.
+-- Only bairros with >= 5 listings on each side, so both medians mean something.
+WITH flagged AS (
+    SELECT
+        l.bairro, l.zone, l.cost_per_m2,
+        EXISTS (SELECT 1 FROM stations s WHERE ST_DWithin(l.geog, s.geog, 500)) AS near_station
+    FROM listings l
+), per_bairro AS (
+    SELECT
+        bairro, zone,
+        COUNT(*) FILTER (WHERE near_station)                                                   AS n_near,
+        COUNT(*) FILTER (WHERE NOT near_station)                                               AS n_far,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cost_per_m2) FILTER (WHERE near_station)     AS median_near,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cost_per_m2) FILTER (WHERE NOT near_station) AS median_far
+    FROM flagged
+    GROUP BY bairro, zone
+)
+SELECT
+    bairro, zone, n_near, n_far,
+    ROUND(median_near::numeric, 1)                         AS median_cost_m2_near,
+    ROUND(median_far::numeric, 1)                          AS median_cost_m2_far,
+    ROUND((100 * (median_near / median_far - 1))::numeric, 1) AS premium_pct
+FROM per_bairro
+WHERE n_near >= 5 AND n_far >= 5
+ORDER BY premium_pct DESC;
+
+
+-- name: nearest_station_distance
+-- Distance from every listing to its nearest station, next to QuintoAndar's flag.
+-- LATERAL runs the inner query once per listing; ORDER BY <-> ... LIMIT 1 is an
+-- index-assisted nearest-neighbour search. (No listing ids: aggregate use only.)
+SELECT
+    l.metro_near,
+    nearest.kind     AS nearest_station_kind,
+    nearest.metres   AS metres_to_station
+FROM listings l
+CROSS JOIN LATERAL (
+    SELECT s.kind, ST_Distance(l.geog, s.geog) AS metres
+    FROM stations s
+    ORDER BY l.geog <-> s.geog
+    LIMIT 1
+) AS nearest;
+
+
 -- name: metro_flag_check
 -- How reliable is QuintoAndar's "metrô próximo" flag? Compare it with the real
--- distance to the nearest station (computed with the <-> nearest-neighbour operator).
+-- distance to the nearest station (same LATERAL nearest-neighbour search as above).
 WITH nearest AS (
     SELECT
-        l.listing_id,
         l.metro_near,
-        (SELECT ST_Distance(l.geog, s.geog)
-         FROM stations s
-         ORDER BY l.geog <-> s.geog
-         LIMIT 1) AS metres_to_station
+        n.metres AS metres_to_station
     FROM listings l
+    CROSS JOIN LATERAL (
+        SELECT ST_Distance(l.geog, s.geog) AS metres
+        FROM stations s
+        ORDER BY l.geog <-> s.geog
+        LIMIT 1
+    ) AS n
 )
 SELECT
     metro_near                                                                          AS quintoandar_says_near,

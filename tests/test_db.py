@@ -105,6 +105,25 @@ def test_spatial_index_is_used(engine):
     assert "listings_geog_gix" in plan
 
 
+def test_stations_loaded(engine):
+    with engine.connect() as conn:
+        kinds = dict(conn.execute(text("SELECT kind, COUNT(*) FROM stations GROUP BY kind")).all())
+    if not kinds:
+        pytest.skip("stations table is empty: run `python -m db.load_stations`")
+    assert set(kinds) <= {"metro", "monorail", "train"}
+    assert kinds.get("metro", 0) >= 50 and kinds.get("train", 0) >= 20   # São Paulo has ~90 metro stations
+
+
+# --------------------------------------------------------------------------
+# Showcase queries (db/queries.sql): every named query runs and returns rows
+# --------------------------------------------------------------------------
+from db.queries import load_queries, run_query  # noqa: E402
+
+@pytest.mark.parametrize("name", list(load_queries()))
+def test_named_query_runs(engine, name):
+    assert len(run_query(name, engine)) > 0
+
+
 # --------------------------------------------------------------------------
 # Constraints reject bad data (each insert is rolled back)
 # --------------------------------------------------------------------------
