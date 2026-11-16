@@ -20,6 +20,11 @@ shapely
 h3
 geopy
 
+# Mobility
+osmium            # pyosmium: read OpenStreetMap .pbf files
+r5py              # transit routing (wraps the Java engine R5)
+jdk4py            # Java runtime inside the venv, used by r5py
+
 # ML / visualisation
 scikit-learn
 matplotlib
